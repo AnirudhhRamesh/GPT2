@@ -17,6 +17,8 @@ import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+from hellaswag import iterate_examples, render_example, get_most_likely_row
+
 # ---------------
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -437,6 +439,17 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item()
+                }
+                # Might also need to add optimizer state dict and rng seed etc
+
+                torch.save(checkpoint, checkpoint_path)
 
     # Once in a while evaluate the model on HellaSwag
     if (step % 250 == 0 or last_step) and (not use_compile):
