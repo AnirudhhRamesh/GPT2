@@ -17,7 +17,7 @@ import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from hellaswag import iterate_examples, render_example, get_most_likely_row
+from hellaswag import iterate_examples, render_example
 
 # ---------------
 class CausalSelfAttention(nn.Module):
@@ -249,7 +249,8 @@ import numpy as np
 
 def load_tokens(filename):
     npt = np.load(filename) #Load the np.uint16 values from the file efficiently
-    ptt = torch.tensot(npt, dtype=torch.long)
+    npt = npt.astype(np.int32) # added after video
+    ptt = torch.tensor(npt, dtype=torch.long)
     return ptt
 
 class DataLoaderLite:
@@ -296,6 +297,28 @@ class DataLoaderLite:
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
+# -----------------------------------------------------------------------------
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
 
 # ----------------------------------------------------------------------------------------------------
 
@@ -330,7 +353,9 @@ else:
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = 'mps' #apple mbp uses metal performance shaders/gpu api
         # NOTE: mps gives really weird bugs (negative losses) which is impossible. CPU does not.
-    device = 'cpu' #OVERRIDE
+    # device = 'cpu' #OVERRIDE
+
+device_type = "cuda" if device.startswith("cuda") else "cpu"
 
 #Get a data batch
 enc = tiktoken.encoding_for_model('gpt2')
@@ -369,7 +394,7 @@ if torch.cuda.is_available():
 # Instead, we accumulate gradient across multiple iterations and then optimize when we hit total_batch_size
 # Much larger batch sizes results in more stable training, thus grad_accum makes sense
 total_batch_size = 524288
-B = 64
+B = 64 #16
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -415,9 +440,15 @@ with open(log_file, "w") as f: #starts empty
 train_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size, split="train") #B=16 does not fit on MPS apple gpu *cries*
 val_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size, split="val")
 
+if master_process:
+    print("Starting training")
+
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
+    
+    # if step == 0 and master_process:
+    #     print("Training loop began")
 
     # Once in a while sample the validation loss
     if step % 250 == 0 or last_step:
@@ -426,11 +457,12 @@ for step in range(max_steps):
         with torch.no_grad():
             val_loss_accum = 0.0
             val_loss_steps = 20
+            # print("Validating model loss...")
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = model(x)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
                 loss = loss / val_loss_steps
                 val_loss_accum += loss.detach()
         if ddp:
@@ -465,7 +497,7 @@ for step in range(max_steps):
             mask = mask.to(device)
 
             with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
@@ -520,13 +552,28 @@ for step in range(max_steps):
     model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
+
+    # if master_process and step < 2:
+    #     print(f"Step {step}: Starting {grad_accum_steps} gradient accumulation steps...")
+
+    # if step == 0 and master_process:
+    #     print(f"Beginning grad accumulation ({grad_accum_steps} steps)")
+
     for micro_step in range(grad_accum_steps):
+        # if step == 0 and micro_step == 0 and master_process:
+        #     print("Training micro_steps began")
+
         x, y = train_loader.next_batch()
         x = x.to(device)
         y = y.to(device)
 
+        # if step == 0 and micro_step == 0 and master_process:
+        #     print(f"Batch loaded, moving to device {device}...")
+
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         if torch.cuda.is_available():
-            with torch.autocast(device_type=device, dtype=torch.bfloat16): #adds 5000 tokens/sec on A100 (BF16)
+            with torch.autocast(device_type=device_type, dtype=torch.bfloat16): #adds 5000 tokens/sec on A100 (BF16)
                 logits, loss = model(x,y)
         else:
             logits, loss = model(x,y)
@@ -565,6 +612,8 @@ for step in range(max_steps):
         print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:2f}ms | tok/sec: {tokens_per_sec}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+# print("Finished training")
 
 if ddp:
     destroy_process_group()
