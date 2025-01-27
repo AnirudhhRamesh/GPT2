@@ -6,7 +6,9 @@ import math
 import time
 import inspect
 import os
+import torch.distributed as dist
 from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # ---------------
 class CausalSelfAttention(nn.Module):
@@ -234,22 +236,35 @@ class GPT(nn.Module):
 
 # ----------------------------------------------------------------------------------------------------
 import tiktoken
+import numpy as np
+
+def load_tokens(filename):
+    npt = np.load(filename) #Load the np.uint16 values from the file efficiently
+    ptt = torch.tensot(npt, dtype=torch.long)
+    return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, world_size, split):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.world_size = world_size
+        assert split in {'train', 'val'}
 
-        with open('input.txt', 'r') as f:
-            text = f.read()
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = sorted(shards)
+        shards = [os.path.join(data_root, s) for s in shards]
 
-        enc = tiktoken.encoding_for_model('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        print(f"Loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")    
+        self.shards = shards
+        assert len(shards) > 0, f"no shards found for split {split}"
+        if master_process:
+            print(f"found {len(shards)} shards for split {split}")
 
-        self.current_position = 0
+        self.current_shard = 0
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -260,9 +275,12 @@ class DataLoaderLite:
         y = (buf[1:].view(B, T))
         
         # Reset the pointer if the next batch would be longer than the tokens length.
-        self.current_position += B * T
-        if self.current_position + B * T + 1 > len(self.tokens):
-            self.current_position = 0
+        self.current_position += B * T * self.process_rank
+        if self.current_position + self.process_rank * B * T + 1 > len(self.tokens):
+            # Advance shard/loop, load in new tokens
+            self.current_shard = (self.current_shard + 1) % len(self.shards)
+            self.tokens = load_tokens(self.shards[self.current_shard])
+            self.current_position = self.B * self.T * self.process_rank
 
         return x, y
 
@@ -322,18 +340,24 @@ torch.set_float32_matmul_precision('high')
 # Get logits
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-if device=='cuda':
+if torch.cuda.is_available():
     model = torch.compile(model) #fuses nodes. Seems to not work on MBP CPU ;(
 
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+
+raw_model = model.module if ddp else model
+
+
 torch.manual_seed(42)
-if device == 'cuda':
+if torch.cuda.is_available():
     torch.cuda.manual_seed(42)
 
 # We can't fit the GPT-2 style batch into one go. 
 # Instead, we accumulate gradient across multiple iterations and then optimize when we hit total_batch_size
 # Much larger batch sizes results in more stable training, thus grad_accum makes sense
 total_batch_size = 524288
-B = 16
+B = 64
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -341,9 +365,6 @@ grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
     print(f'total desired batch size: {total_batch_size}')
     print(f'=> calculated gradient accumulation steps: {grad_accum_steps}')
-
-print("I am gpu", ddp_rank)
-print("bye")
 
 # logits, loss = model(x, y)
 
@@ -353,8 +374,9 @@ print("bye")
 # Cosine-decay learning rate
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715
+max_steps = 19073 #total tokens / total_batch_size
+
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it+1) / warmup_steps
@@ -367,10 +389,10 @@ def get_lr(it):
 
 # optimize
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 # train_loader = DataLoaderLite(B=4, T=32)
-train_loader = DataLoaderLite(B, T) #B=16 does not fit on MPS apple gpu *cries*
+train_loader = DataLoaderLite(B, T, ddp_rank, ddp_world_size, split="train") #B=16 does not fit on MPS apple gpu *cries*
 
 for step in range(max_steps):
     t0 = time.time()
@@ -381,7 +403,7 @@ for step in range(max_steps):
         x = x.to(device)
         y = y.to(device)
 
-        if device == 'cuda':
+        if torch.cuda.is_available():
             with torch.autocast(device_type=device, dtype=torch.bfloat16): #adds 5000 tokens/sec on A100 (BF16)
                 logits, loss = model(x,y)
         else:
@@ -389,8 +411,17 @@ for step in range(max_steps):
         
         loss = loss / grad_accum_steps #need to scale due to grad_accum
         loss_accum += loss.detach()
+        
+        if ddp:
+            # Ensure we only synchronize gpu losses at the end of grad accum (using the ddp sync flag)
+            model.require_backward_grad_sync == (micro_step == grad_accum_steps - 1)
+
         loss.backward()
     
+    if ddp:
+        # Every node broadcasts the local losses and averages it
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
     #calculate global norm. For every grad of every param, square it, add it all, take the sqrt => norm. Ensure it's not more than 1.0
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
@@ -399,15 +430,20 @@ for step in range(max_steps):
         param_group['lr'] = lr
 
     optimizer.step()
-    if device=='cuda':
+    if torch.cuda.is_available():
         torch.cuda.synchronize() #Wait for gpu to finish all the scheduled tasks
     elif device == 'mps':
         torch.mps.synchronize()
     t1 = time.time()
     dt = (t1 - t0)
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
-    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:2f}ms | tok/sec: {tokens_per_sec}")
+
+    if master_process:
+        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:2f}ms | tok/sec: {tokens_per_sec}")
+
+if ddp:
+    destroy_process_group()
 
 import sys;sys.exit(0)
 
