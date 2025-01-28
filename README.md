@@ -327,6 +327,8 @@ If I find an extra week somewhere, maybe I'll do this haha (but it would mostly 
 
 In case you're interested, I also made a video demo where I walk through all the details
 
+https://github.com/user-attachments/assets/684ad73a-de67-4b66-8e8b-67bc4fe5b269
+
 # Acknowledgements
 
 Karpathy is the best. Absolute insane that I can learn from one of the world's top ML researchers completely free, online, anytime.
