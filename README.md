@@ -125,11 +125,15 @@ There are multiple improvements:
 1. We use learnable embeddings instead of one-hot encoded vectors.
    This means we have a much more compact representation of each char. Additionally, since this is learnable, it means similar chars/words get mapped together and thus when we make predictions we'd expect these to also be interchangeable (e.g. 'the cat crossed the (pred: road)' should also be likely even if only 'the dog crossed the (pred:road)' was present in the training data, since cat and dog embeddings would have been learnt as similar to each other).
 
+![alt text](images/embeddings.png)
+
+Here is an image of the embeddings being learned. I didn't train the model long enough, but notice in the bottom half the vowels are starting to cluster together (which makes sense, vowels are mostly similar/interchangeable in the context of a sentence).
+
 2. We use a hidden layer before the output layer of vocab_size.
    The hidden layer allows us to spend more compute to identify hidden patterns/relations in our dataset (and thus better fit/model the data).
    We also concatenating context_size/block_size embeddings together as the input to the neural network - this allows us to increase the context size much more scalably than the bi-gram model.
 
-As a result, our predictions get better ((Actually, somehow it seems it goes worse but I wouldn't discount me having a bug haha).
+As a result, our predictions get better (Actually, it got worse because I didn't train for long enough (was on a MBP CPU and didn't have easy access to GPU)).
 
 ![alt text](images/image-5.png)
 
@@ -318,6 +322,10 @@ I would have to train for much longer, but if I do, some cool things I'd love to
 - Take the weights of the embedding layer and convert this into an embedding API service (and also use it for my blog chat project](https://blog-chatify.vercel.app)), exactly like [Mixedbread](https://www.mixedbread.ai).
 
 If I find an extra week somewhere, maybe I'll do this haha (but it would mostly be to flex as I again don't have much users and it's completely unnecessarily overengineered when I could just use an existing API haha)
+
+# Video demo
+
+In case you're interested, I also made a video demo where I walk through all the details
 
 # Acknowledgements
 
